@@ -3,19 +3,25 @@
   RV-Validation.ps1 - control validation after closing audit gaps (ASCII only, no encoding issues).
 
 .DESCRIPTION
-  0. Preflight: shows the audit policy (auditpol, by GUID - works on any OS language),
-     CommandLine-in-4688 registry setting and Wazuh agent state.
+  Does not change the system permanently (persistent fixes live in RV-Remediate.ps1).
+  0. Preflight: audit policy (auditpol, by GUID - works on any OS language),
+     CommandLine-in-4688 and PowerShell Script Block Logging registry settings.
   1. Creates test events. Every created object (service, task, firewall rule, local user)
      is removed in a finally block, even if a step fails or the run is interrupted.
   2. Polls local event logs until all events are found or -TimeoutSec expires.
-  3. Optionally checks that the events reached Wazuh (-IndexerUrl).
+  3. Wazuh agent diagnostics: service, state, ossec.log (buffer/flood/connection),
+     duplicated channel subscriptions (ossec.conf vs shared agent.conf), network/firewall profiles.
+     Optionally checks that the events reached Wazuh (-IndexerUrl).
+  4. -Stats: firewall rule change history and top Event IDs per log for the last 24h.
   Results: <OutDir>\RV-validation-<host>-<time>.txt / .csv
   Exit code: 0 - everything found, 1 - something MISSING, 2 - not run as Administrator.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\RV-Validation.ps1
 .EXAMPLE
-  .\RV-Validation.ps1 -Skip share,user -TimeoutSec 60 -PsStats
+  .\RV-Validation.ps1 -Skip share,user -TimeoutSec 60 -Stats
+.EXAMPLE
+  .\RV-Validation.ps1 -Only task,firewall
 .EXAMPLE
   .\RV-Validation.ps1 -IndexerUrl https://wazuh-indexer:9200 -IndexerCredential (Get-Credential) -SkipCertificateCheck
 #>
@@ -26,9 +32,11 @@ param(
   # How long to wait for events in local logs
   [ValidateRange(5, 600)][int]$TimeoutSec = 30,
   # Test groups to skip
-  [ValidateSet('cmd', 'logon', 'service', 'task', 'firewall', 'share', 'user')][string[]]$Skip = @(),
-  # Count Event IDs in PowerShell/Operational for the last 24h (can take minutes)
-  [switch]$PsStats,
+  [ValidateSet('cmd', 'logon', 'service', 'task', 'firewall', 'share', 'user', 'powershell')][string[]]$Skip = @(),
+  # Run only these test groups (cannot be combined with -Skip)
+  [ValidateSet('cmd', 'logon', 'service', 'task', 'firewall', 'share', 'user', 'powershell')][string[]]$Only = @(),
+  # 24h statistics: firewall rule change history, top Event IDs per log (can take a few minutes)
+  [Alias('PsStats')][switch]$Stats,
   # Wazuh indexer (OpenSearch) URL, e.g. https://10.0.0.5:9200. Empty - Wazuh delivery is not checked
   [string]$IndexerUrl,
   [pscredential]$IndexerCredential,
@@ -51,6 +59,12 @@ function Exit-Script {
   $global:LASTEXITCODE = $Code
 }
 
+if ($Only -and $Skip) {
+  Write-Host '-Only and -Skip cannot be used together.' -ForegroundColor Red
+  Exit-Script 2
+  return
+}
+
 $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Write-Host 'Run this script as Administrator (Security log, sc, schtasks, firewall and local users need it).' -ForegroundColor Red
@@ -66,6 +80,9 @@ $marker = "RVTEST$stamp"
 $fakeUser = 'rv_fake_user'
 $rvUser = 'rv_' + (Get-Random -Minimum 100000 -Maximum 999999)  # local user names are limited to 20 chars
 $exitCode = 0
+$groups = @('cmd', 'logon', 'service', 'task', 'firewall', 'share', 'user', 'powershell')
+if ($Only) { $Skip = @($groups | Where-Object { $Only -notcontains $_ }) }
+$psLog = 'Microsoft-Windows-PowerShell/Operational'
 
 # --- Helpers ---
 function Get-EvData {
@@ -88,6 +105,43 @@ function Get-AuditSetting {
   $r = $o | Where-Object { $_ } | ConvertFrom-Csv | Select-Object -First 1
   if (-not $r) { return 'n/a' }
   @($r.PSObject.Properties)[4].Value  # 'Inclusion Setting' (header is localized too)
+}
+
+function Get-SblState {
+  $s = foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging', 'HKLM:\SOFTWARE\Policies\Microsoft\PowerShellCore\ScriptBlockLogging') {
+    $p = Get-ItemProperty $k -ErrorAction SilentlyContinue
+    if ($p) { '{0}: Logging={1} Invocation={2}' -f ($k -replace '^.*\\Microsoft\\', ''), $p.EnableScriptBlockLogging, $p.EnableScriptBlockInvocationLogging }
+  }
+  if ($s) { $s -join '; ' } else { 'ScriptBlockLogging policy: not set' }
+}
+
+# Wazuh config files may contain several <ossec_config> roots - wrap them; XML parsing ignores commented-out blocks
+function Read-AgentXml {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) { return $null }
+  try { [xml]('<root>' + (Get-Content -LiteralPath $Path -Raw) + '</root>') }
+  catch { Warn "$(Split-Path $Path -Leaf) is not valid XML: $($_.Exception.Message)"; $null }
+}
+
+# Event ID counts without rendering events (fast, max $Max events)
+function Get-IdCount {
+  param([string]$Log, [int]$Hours = 24, [int]$Max = 300000)
+  $from = (Get-Date).AddHours(-$Hours).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+  $q = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($Log, [System.Diagnostics.Eventing.Reader.PathType]::LogName, "*[System[TimeCreated[@SystemTime>='$from']]]")
+  $r = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($q)
+  $by = @{}; $n = 0
+  try {
+    while ($null -ne ($e = $r.ReadEvent())) { $k = $e.Id; if ($by.ContainsKey($k)) { $by[$k]++ } else { $by[$k] = 1 }; $e.Dispose(); $n++; if ($n -ge $Max) { break } }
+  } finally { $r.Dispose() }
+  [pscustomobject]@{ Total = $n; ById = $by; Capped = ($n -ge $Max) }
+}
+
+# Newest events as XML strings via wevtutil (not recorded by PowerShell Module Logging)
+function Read-EvXml {
+  param([string]$Log, [string]$Query, [int]$Max = 200)
+  $raw = (wevtutil.exe qe "$Log" "/q:$Query" /c:$Max /rd:true /e:Events 2>$null) -join ''
+  if (-not $raw) { return @() }
+  @([regex]::Matches($raw, '<Event .*?</Event>') | ForEach-Object { $_.Value })
 }
 
 function Invoke-Indexer {
@@ -130,6 +184,7 @@ $tests = @(
   @{ Gen = 'task';     Test = 'schtasks /create';          Id = 4698; Log = 'Security'; Sub = '0CCE9227-69AE-11D9-BED3-505054503030'; Before = 'TaskScheduler 106 only'; After = '4698 with task XML' }
   @{ Gen = 'task';     Test = 'schtasks /delete';          Id = 4699; Log = 'Security'; Sub = '0CCE9227-69AE-11D9-BED3-505054503030'; Before = 'TaskScheduler 141 only'; After = '4699' }
   @{ Gen = 'firewall'; Test = 'New-NetFirewallRule';       Id = 4946; Log = 'Security'; Sub = '0CCE9232-69AE-11D9-BED3-505054503030'; Before = 'Firewall 2004 only';     After = '4946' }
+  @{ Gen = 'firewall'; Test = 'Set-NetFirewallRule';       Id = 4947; Log = 'Security'; Sub = '0CCE9232-69AE-11D9-BED3-505054503030'; Before = 'Firewall 2005 only';     After = '4947' }
   @{ Gen = 'firewall'; Test = 'Remove-NetFirewallRule';    Id = 4948; Log = 'Security'; Sub = '0CCE9232-69AE-11D9-BED3-505054503030'; Before = 'Firewall 2006 only';     After = '4948' }
   @{ Gen = 'share';    Test = 'dir \\127.0.0.1\C$';        Id = 5140; Log = 'Security'; Sub = '0CCE9224-69AE-11D9-BED3-505054503030'; Before = 'No auditing';            After = 'Success'
      Filter = { param($d, $x) $d.ShareName -like '*\C$' -and @('127.0.0.1', '::1', '::ffff:127.0.0.1') -contains $d.IpAddress }; WMatch = 'C$' }
@@ -137,6 +192,7 @@ $tests = @(
      Filter = { param($d, $x) $d.TargetUserName -eq $rvUser }; WMatch = $rvUser }
   @{ Gen = 'user';     Test = 'local user delete';         Id = 4726; Log = 'Security'; Sub = '0CCE9235-69AE-11D9-BED3-505054503030'; Before = '?';                      After = 'Success'
      Filter = { param($d, $x) $d.TargetUserName -eq $rvUser }; WMatch = $rvUser }
+  @{ Gen = 'powershell'; Test = 'powershell script block';  Id = 4104; Log = $psLog;     Sub = '';                                     Before = '?';                      After = '4104 on, 4105/4106 off' }
 )
 for ($i = 0; $i -lt $tests.Count; $i++) { $tests[$i].Idx = $i }
 foreach ($t in $tests) {
@@ -161,7 +217,10 @@ $actions = [ordered]@{
     Undo = { $o = schtasks.exe /delete /tn "$marker-task" /f 2>&1; if ($LASTEXITCODE) { throw "schtasks /delete: $o" } }
   }
   firewall = @{
-    Do   = { New-NetFirewallRule -DisplayName "$marker-fw" -Direction Inbound -Action Block -Protocol TCP -LocalPort 65000 -ErrorAction Stop | Out-Null }
+    Do   = {
+      New-NetFirewallRule -DisplayName "$marker-fw" -Direction Inbound -Action Block -Protocol TCP -LocalPort 65000 -ErrorAction Stop | Out-Null
+      Set-NetFirewallRule -DisplayName "$marker-fw" -Description 'rv change test' -ErrorAction Stop  # 4947
+    }
     Undo = { Remove-NetFirewallRule -DisplayName "$marker-fw" -ErrorAction Stop }
   }
   share    = @{ Do = { Get-ChildItem '\\127.0.0.1\C$' -ErrorAction Stop | Select-Object -First 1 | Out-Null } }
@@ -174,6 +233,8 @@ $actions = [ordered]@{
     }
     Undo = { ([ADSI]"WinNT://$env:COMPUTERNAME").Delete('User', $rvUser) }
   }
+  # child process so its script block is logged as a separate 4104 with the marker
+  powershell = @{ Do = { $o = powershell.exe -NoProfile -Command "Write-Output 'PSCHECK_$marker'" 2>&1; if ($LASTEXITCODE) { throw "powershell.exe: $o" } } }
 }
 
 Start-Transcript -LiteralPath $txt | Out-Null
@@ -191,6 +252,8 @@ try {
   $cmdLineKey = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name ProcessCreationIncludeCmdLine_Enabled -ErrorAction SilentlyContinue
   if ($cmdLineKey -and $cmdLineKey.ProcessCreationIncludeCmdLine_Enabled -eq 1) { Write-Host 'ProcessCreationIncludeCmdLine_Enabled: 1 (CommandLine in 4688)' }
   else { Write-Host 'ProcessCreationIncludeCmdLine_Enabled: NOT set (4688 without CommandLine)' -ForegroundColor Yellow }
+  $sbl = Get-SblState
+  Write-Host $sbl
 
   # --- 1. Generate events ---
   Step '[1] Generating test events'
@@ -252,12 +315,17 @@ try {
         $row.Local = 'MISSING'
         if ($t.Seen) { $row.Note = "events with this ID exist ($($t.Seen)), but none match" }
       }
+      if ($t.Id -eq 4104) {
+        $inv = @(Get-WinEvent -FilterHashtable @{ LogName = $psLog; Id = 4105, 4106; StartTime = $start } -ErrorAction SilentlyContinue).Count
+        $row.AuditPolicy = $sbl
+        $row.Note = (@($row.Note, "4105/4106 since start: $inv (expected 0)") | Where-Object { $_ }) -join '; '
+      }
       if ($genErr[$t.Gen]) { $row.Note = (@($row.Note, $genErr[$t.Gen]) | Where-Object { $_ }) -join '; ' }
     }
     [pscustomobject]$row
   }
 
-  # --- 3. Wazuh agent ---
+  # --- 3. Wazuh agent and firewall diagnostics (read-only) ---
   Step '[3] Wazuh agent'
   $svc = Get-Service WazuhSvc -ErrorAction SilentlyContinue
   if ($svc) { Write-Host "WazuhSvc service: $($svc.Status)" } else { Write-Host 'WazuhSvc service: not found' -ForegroundColor Yellow }
@@ -266,23 +334,47 @@ try {
     $state = Join-Path $agentDir 'wazuh-agent.state'
     if (Test-Path $state) {
       Write-Host 'wazuh-agent.state:'
-      Get-Content $state | Where-Object { $_ -match '^(status|last_keepalive|last_ack|msg_count|msg_sent)' } | ForEach-Object { Write-Host "  $_" }
+      Get-Content $state | Where-Object { $_ -match '^\w+=' } | ForEach-Object { Write-Host "  $_" }
     }
+    $proc = Get-Process -Name 'wazuh-agent' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc) { Write-Host "Agent process start: $($proc.StartTime)" }
+
     $log = Join-Path $agentDir 'ossec.log'
     if (Test-Path $log) {
+      $lines = @(Get-Content -LiteralPath $log -Tail 20000)
       Write-Host 'ossec.log - last ERROR/WARNING lines:'
-      Get-Content $log -Tail 3000 | Where-Object { $_ -match 'ERROR|WARNING' } | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
+      $lines | Where-Object { $_ -match 'ERROR|WARNING' } | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" }
+      $buf = @($lines | Where-Object { $_ -match 'buffer|flood|drop|discard' })
+      if ($buf.Count) { Write-Host "ossec.log - buffer/flood/drop lines: $($buf.Count) (last 15):" -ForegroundColor Yellow; $buf | Select-Object -Last 15 | ForEach-Object { Write-Host "  $_" } }
+      else { Write-Host 'ossec.log - no buffer/flood/drop messages in last 20000 lines' }
+      Write-Host 'ossec.log - connection events (last 10):'
+      $lines | Where-Object { $_ -match 'Lost connection|Connected to the server' } | Select-Object -Last 10 | ForEach-Object { Write-Host "  $_" }
     }
-    $conf = Join-Path $agentDir 'ossec.conf'
-    if (Test-Path $conf) {
-      # ossec.conf may contain several <ossec_config> roots - wrap it; XML parsing ignores commented-out blocks
-      try {
-        $cx = [xml]('<root>' + (Get-Content -LiteralPath $conf -Raw) + '</root>')
-        $sec = $cx.SelectNodes("//localfile[normalize-space(location)='Security' and normalize-space(log_format)='eventchannel']")
-        if ($sec.Count) { Write-Host 'Security channel in ossec.conf: yes' } else { Write-Host 'Security channel in ossec.conf: NO' -ForegroundColor Yellow }
-      } catch { Warn "ossec.conf is not valid XML: $($_.Exception.Message)" }
+
+    # Channel subscriptions: local ossec.conf vs group shared\agent.conf
+    $subs = @()
+    foreach ($f in 'ossec.conf', 'shared\agent.conf') {
+      $cx = Read-AgentXml (Join-Path $agentDir $f)
+      if (-not $cx) { continue }
+      foreach ($n in $cx.SelectNodes('//localfile[location]')) {
+        $subs += [pscustomobject]@{ Location = $n.location.Trim(); Format = "$($n.log_format)".Trim(); File = $f }
+      }
+      foreach ($n in $cx.SelectNodes('//client_buffer/queue_size | //client_buffer/events_per_second')) { Write-Host ("{0}: {1} = {2}" -f $f, $n.Name, $n.InnerText.Trim()) }
     }
+    $secIn = @($subs | Where-Object { $_.Location -eq 'Security' -and $_.Format -eq 'eventchannel' } | ForEach-Object { $_.File } | Select-Object -Unique)
+    if ($secIn) { Write-Host "Security channel subscribed in: $($secIn -join ', ')" } else { Write-Host 'Security channel subscribed: NO' -ForegroundColor Yellow }
+    $dups = @($subs | Group-Object Location | Where-Object { $_.Count -gt 1 })
+    if ($dups) {
+      Write-Host 'Channels defined more than once (events are collected twice):' -ForegroundColor Yellow
+      foreach ($g in $dups) { Write-Host ("  {0} <- {1}" -f $g.Name, (($g.Group | ForEach-Object { $_.File }) -join ', ')) }
+    } else { Write-Host "No duplicated channels ($(@($subs | Select-Object -ExpandProperty Location -Unique).Count) unique locations)" }
   } else { Write-Host 'Wazuh agent folder not found' -ForegroundColor Yellow }
+
+  Step '[3a] Network and firewall profiles'
+  try {
+    foreach ($c in (Get-NetConnectionProfile -ErrorAction Stop)) { Write-Host ("  Connection: {0} | {1} | {2}" -f $c.Name, $c.InterfaceAlias, $c.NetworkCategory) }
+    foreach ($f in (Get-NetFirewallProfile -ErrorAction Stop)) { Write-Host ("  FW profile: {0} | Enabled={1} | LogBlocked={2} | LogAllowed={3} | {4}" -f $f.Name, $f.Enabled, $f.LogBlocked, $f.LogAllowed, $f.LogFileName) }
+  } catch { Warn "profiles: $($_.Exception.Message)" }
 
   # --- 3b. Delivery to Wazuh indexer (optional) ---
   if ($IndexerUrl) {
@@ -325,24 +417,41 @@ try {
   $bad = $okLocal -lt $checked.Count -or ($IndexerUrl -and @($checked | Where-Object { $_.Wazuh -notlike 'OK*' }).Count)
   if ($bad) { $exitCode = 1; Write-Host $summary -ForegroundColor Red } else { Write-Host $summary -ForegroundColor Green }
 
-  # --- 4. What fills PowerShell/Operational (optional: -PsStats, can take a few minutes) ---
-  if ($PsStats) {
-    Step '[4] PowerShell/Operational - Event IDs for last 24h (fast reader, max 300000)'
-    $from = (Get-Date).AddHours(-24).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    $q = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery('Microsoft-Windows-PowerShell/Operational', [System.Diagnostics.Eventing.Reader.PathType]::LogName, "*[System[TimeCreated[@SystemTime>='$from']]]")
-    $r = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($q)
-    $by = @{}; $n = 0
-    try {
-      while ($null -ne ($e = $r.ReadEvent())) { $k = $e.Id; if ($by.ContainsKey($k)) { $by[$k]++ } else { $by[$k] = 1 }; $e.Dispose(); $n++; if ($n -ge 300000) { break } }
-    } finally { $r.Dispose() }
-    Write-Host "  read $n events"
-    $by.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 8 @{n = 'EventID'; e = { $_.Key } }, @{n = 'Count'; e = { $_.Value } } | Format-Table -AutoSize | Out-String | Write-Host
-  } else { Step '[4] PowerShell/Operational stats skipped (run with -PsStats to include)' }
+  # --- 4. 24h statistics (optional: -Stats, can take a few minutes) ---
+  if ($Stats) {
+    Step '[4] Firewall rule changes, last 24h (newest 200 per source)'
+    $w24 = 'TimeCreated[timediff(@SystemTime) <= 86400000]'
+    $fieldOf = { param($x, $n) $m = [regex]::Match($x, "<Data Name='$n'>(.*?)</Data>"); if ($m.Success) { $m.Groups[1].Value } else { '' } }
+    $headOf = { param($x) '{0} UTC  {1}' -f [regex]::Match($x, "SystemTime='([^']+)'").Groups[1].Value, [regex]::Match($x, '<EventID[^>]*>(\d+)</EventID>').Groups[1].Value }
+    $fw = Read-EvXml 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall' "*[System[(EventID=2004 or EventID=2005 or EventID=2006 or EventID=2033 or EventID=2097) and $w24]]"
+    Write-Host "  Firewall channel 2004/2005/2006/2033/2097: $($fw.Count)"
+    foreach ($x in $fw) { Write-Host ("    {0}  Rule='{1}'  App='{2}'  ModifyingUser='{3}'  ModifyingApp='{4}'" -f (& $headOf $x), (& $fieldOf $x 'RuleName'), (& $fieldOf $x 'ApplicationPath'), (& $fieldOf $x 'ModifyingUser'), (& $fieldOf $x 'ModifyingApplication')) }
+    $fs = Read-EvXml 'Security' "*[System[(EventID=4946 or EventID=4947 or EventID=4948) and $w24]]"
+    Write-Host "  Security 4946/4947/4948: $($fs.Count)"
+    foreach ($x in $fs) { Write-Host ("    {0}  RecordId={1}  Rule='{2}'" -f (& $headOf $x), [regex]::Match($x, '<EventRecordID>(\d+)</EventRecordID>').Groups[1].Value, (& $fieldOf $x 'RuleName')) }
+    $sy = @(Read-EvXml 'Microsoft-Windows-Sysmon/Operational' "*[System[EventID=1 and $w24]]" 2000 | Where-Object { $_ -match 'netsh|NetFirewallRule|MpCmdRun|TiWorker|MsMpEng' } | Select-Object -First 15)
+    Write-Host "  Sysmon 1 matching netsh / NetFirewallRule / MpCmdRun / TiWorker / MsMpEng: $($sy.Count)"
+    foreach ($x in $sy) { Write-Host ("    {0}  User='{1}'  Image='{2}'  Cmd='{3}'" -f (& $headOf $x), (& $fieldOf $x 'User'), (& $fieldOf $x 'Image'), (& $fieldOf $x 'CommandLine')) }
+
+    foreach ($ln in 'Microsoft-Windows-Sysmon/Operational', $psLog, 'Windows PowerShell', 'Security') {
+      Step "[4] Top Event IDs, last 24h: $ln"
+      try {
+        $c = Get-IdCount $ln
+        Write-Host ("  total: {0}{1}" -f $c.Total, $(if ($c.Capped) { ' (capped)' } else { '' }))
+        $c.ById.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10 | ForEach-Object { Write-Host ("    {0,-7} {1}" -f $_.Key, $_.Value) }
+      } catch { Warn "$ln : $($_.Exception.Message)" }
+    }
+  } else { Step '[4] 24h statistics skipped (run with -Stats to include)' }
 
   Write-Host "`n=== Done. Please send these files: ===" -ForegroundColor Green
   Write-Host "  $txt"
   Write-Host "  $csv"
   Write-Host ("Wazuh search: agent.name:""{0}"" from {1} UTC, marker {2}, test user {3}" -f $AgentName, $start.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'), $marker, $rvUser)
+  $rids = @($rows | Where-Object { $_.RecordId } | ForEach-Object { $_.RecordId })
+  if ($rids) { Write-Host ("Dashboard: agent.name:""{0}"" and data.win.system.eventRecordID:({1})" -f $AgentName, ($rids -join ' or ')) }
+  Write-Host 'On the Wazuh manager (archives.json needs <logall_json>yes</logall_json>):'
+  Write-Host "  grep '$marker' /var/ossec/logs/archives/archives.json | grep -o '`"eventID`":`"[0-9]*`"' | sort | uniq -c"
+  Write-Host "  grep '$marker' /var/ossec/logs/alerts/alerts.json | grep -o '`"rule`":{[^}]*}' | sort | uniq -c"
 } finally {
   Stop-Transcript | Out-Null
 }
