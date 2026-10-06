@@ -10,6 +10,20 @@ or the run is interrupted with Ctrl+C.
 
 Results are saved to `C:\SOC_Audit\RV-validation-<host>-<time>.txt` (log) and `.csv` (table).
 
+## Scripts
+
+| Script | Purpose | Changes the system |
+|---|---|---|
+| `RV-Validation.ps1` | Test events + read-only diagnostics: audit policy, agent state, buffer/flood, duplicated channels, firewall profiles, 24h statistics (`-Stats`) | Only temporarily (test objects are removed right away) |
+| `RV-Remediate.ps1` | Agreed persistent fixes with backup, `-WhatIf` and `-Restore`; runs `RV-Validation.ps1` at the end | **Yes**, only with explicit switches |
+
+Recommended order:
+
+1. Run `RV-Validation.ps1` and review the result.
+2. If fixes are agreed, run `RV-Remediate.ps1 ... -WhatIf` to preview them, then without `-WhatIf`.
+   It makes a backup, applies the fixes and runs the validation again by itself.
+3. If something goes wrong: `RV-Remediate.ps1 -Restore <backup folder>`.
+
 ## Quick start (one line)
 
 You need PowerShell **running as Administrator**.
@@ -23,7 +37,7 @@ Download and run without saving anything to disk:
 With flags (append them to the end of the line):
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/egwyl666/journal_validator/main/RV-Validation.ps1))) -TimeoutSec 60 -Skip share -PsStats
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/egwyl666/journal_validator/main/RV-Validation.ps1))) -TimeoutSec 60 -Skip share -Stats
 ```
 
 From `cmd.exe` or Run (Win+R). Downloads the file to `%TEMP%` first, then runs it:
@@ -47,8 +61,9 @@ powershell -ExecutionPolicy Bypass -File .\RV-Validation.ps1
 |---|---|---|
 | `-OutDir <path>` | `C:\SOC_Audit` | Folder for `.txt` and `.csv` |
 | `-TimeoutSec <5-600>` | `30` | How long to wait for events in local logs |
-| `-Skip <groups>` | — | Skip test groups: `cmd`, `logon`, `service`, `task`, `firewall`, `share`, `user` |
-| `-PsStats` | off | Top Event IDs in `PowerShell/Operational` for the last 24h (can take a few minutes) |
+| `-Skip <groups>` | — | Skip test groups: `cmd`, `logon`, `service`, `task`, `firewall`, `share`, `user`, `powershell` |
+| `-Only <groups>` | — | Run only these test groups (cannot be combined with `-Skip`), e.g. `-Only task,firewall` |
+| `-Stats` | off | Firewall rule change history and top Event IDs (Sysmon, PowerShell, Security) for the last 24h; can take a few minutes. Old name `-PsStats` still works |
 | `-IndexerUrl <url>` | — | Wazuh indexer (OpenSearch) URL, e.g. `https://10.0.0.5:9200`. Without it, Wazuh delivery is not checked |
 | `-IndexerCredential <cred>` | — | Indexer account: `-IndexerCredential (Get-Credential)` |
 | `-AgentName <name>` | host name | `agent.name` in Wazuh, if it differs from the computer name |
@@ -72,13 +87,43 @@ Example with an end-to-end Wazuh delivery check:
 | `logon` | wrong password for `rv_fake_user` | 4625, 4776 | Logon, Credential Validation |
 | `service` | `sc create` / `sc delete` | 4697, 7045 | Security System Extension |
 | `task` | `schtasks /create` / `/delete` | 4698, 4699 | Other Object Access Events |
-| `firewall` | `New-` / `Remove-NetFirewallRule` | 4946, 4948 | MPSSVC Rule-Level Policy Change |
+| `firewall` | `New-` / `Set-` / `Remove-NetFirewallRule` | 4946, 4947, 4948 | MPSSVC Rule-Level Policy Change |
 | `share` | `dir \\127.0.0.1\C$` | 5140 | File Share |
 | `user` | create / delete local user `rv_NNNNNN` | 4720, 4726 | User Account Management |
+| `powershell` | child `powershell.exe` with a marker | 4104 (+ count of 4105/4106, expected 0) | Script Block Logging policy |
+
+After the tests the script checks the Wazuh agent: service, `wazuh-agent.state`, buffer/flood/drop and
+connection lines in `ossec.log`, `queue_size` / `events_per_second`, channels defined more than once in
+`ossec.conf` and the group `shared\agent.conf`, and the network / firewall profiles. At the end it prints a
+dashboard query by `eventRecordID` and `grep` commands for the Wazuh manager.
 
 Before the tests the script shows the current audit policy (`auditpol` by GUID, so it works
 on any OS language) and the `ProcessCreationIncludeCmdLine_Enabled` registry value. They show
 right away why an event is missing.
+
+## RV-Remediate.ps1
+
+Without switches it changes nothing: it makes a backup and runs the validation.
+
+| Flag | Description |
+|---|---|
+| `-FixAgentConfig` | Remove from the local `ossec.conf` every `<localfile>` that also exists in the group `shared\agent.conf`, and the local `<client_buffer>` if the group defines one. Rolls back automatically if the agent does not reconnect within 90 s |
+| `-DisableInvocationLogging` | `EnableScriptBlockInvocationLogging = 0` (stops 4105/4106, 4104 stays on) |
+| `-FirewallLogging` | `LogBlocked = True` and log files `domainfw/privatefw/publicfw.log` (logging only, no traffic impact) |
+| `-EnablePublicFirewall` | Turn on the firewall in the Public profile (**only with the server owner's approval**) |
+| `-WhatIf` | Show what would be changed, change nothing |
+| `-Restore <folder>` | Roll back from a `backup-<time>` folder |
+| `-Only`, `-AgentName`, `-OutDir` | Passed to `RV-Validation.ps1` |
+| `-NoValidation` | Do not run `RV-Validation.ps1` at the end |
+
+```powershell
+.\RV-Remediate.ps1 -FixAgentConfig -DisableInvocationLogging -FirewallLogging -WhatIf
+.\RV-Remediate.ps1 -FixAgentConfig -DisableInvocationLogging -FirewallLogging
+.\RV-Remediate.ps1 -Restore C:\SOC_Audit\backup-20261006_120000
+```
+
+`RV-Validation.ps1` is taken from the same folder, from `-OutDir`, or downloaded from GitHub.
+Exit code: the validator's code, `2` — not Administrator, `3` — the agent config change was rolled back.
 
 ## Output
 
